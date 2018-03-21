@@ -7,10 +7,12 @@ import (
 	"time"
 
 	"github.com/lightninglabs/neutrino"
+	"github.com/roasbeef/btcd/chaincfg"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
 	"github.com/roasbeef/btcd/rpcclient"
 	"github.com/roasbeef/btcd/wire"
 	"github.com/roasbeef/btcutil"
+	"github.com/roasbeef/btcutil/gcs/builder"
 	"github.com/roasbeef/btcwallet/waddrmgr"
 	"github.com/roasbeef/btcwallet/wtxmgr"
 )
@@ -18,6 +20,8 @@ import (
 // NeutrinoClient is an implementation of the btcwalet chain.Interface interface.
 type NeutrinoClient struct {
 	CS *neutrino.ChainService
+
+	chainParams *chaincfg.Params
 
 	// We currently support one rescan/notifiction goroutine per client
 	rescan *neutrino.Rescan
@@ -42,8 +46,13 @@ type NeutrinoClient struct {
 
 // NewNeutrinoClient creates a new NeutrinoClient struct with a backing
 // ChainService.
-func NewNeutrinoClient(chainService *neutrino.ChainService) *NeutrinoClient {
-	return &NeutrinoClient{CS: chainService}
+func NewNeutrinoClient(chainParams *chaincfg.Params,
+	chainService *neutrino.ChainService) *NeutrinoClient {
+
+	return &NeutrinoClient{
+		CS:          chainService,
+		chainParams: chainParams,
+	}
 }
 
 // BackEnd returns the name of the driver.
@@ -164,6 +173,75 @@ func (s *NeutrinoClient) SendRawTransaction(tx *wire.MsgTx, allowHighFees bool) 
 	}
 	hash := tx.TxHash()
 	return &hash, nil
+}
+
+func (s *NeutrinoClient) FilterBlocks(
+	req *FilterBlocksRequest) (*FilterBlocksResponse, error) {
+
+	blockFilterer := NewBlockFilterer(
+		s.chainParams, req.ExternalAddrs, req.InternalAddrs,
+	)
+
+	nAddrs := len(req.ExternalAddrs) + len(req.InternalAddrs)
+	watchList := make([][]byte, nAddrs)
+	for _, addr := range req.ExternalAddrs {
+		watchList = append(watchList, addr.ScriptAddress())
+	}
+	for _, addr := range req.InternalAddrs {
+		watchList = append(watchList, addr.ScriptAddress())
+	}
+
+	// Iterate over the requested blocks, fetching each from the rpc client.
+	// Each block will scanned using the reverse addresses indexes generated
+	// above, breaking out early if any addresses are found.
+	for i, blk := range req.Blocks {
+		filter, err := s.CS.GetCFilter(blk.Hash, wire.GCSFilterRegular)
+		if err != nil {
+			return nil, err
+		}
+
+		if filter == nil || filter.N() == 0 {
+			log.Infof("empty filter at height=%d", blk.Height)
+			continue
+		}
+
+		key := builder.DeriveKey(&blk.Hash)
+		matched, err := filter.MatchAny(key, watchList)
+		if err != nil {
+			return nil, err
+		} else if !matched {
+			continue
+		}
+
+		log.Infof("matched block height=%d", blk.Height)
+
+		rawBlock, err := s.GetBlock(&blk.Hash)
+		if err != nil {
+			return nil, err
+		}
+
+		if !blockFilterer.FilterBlock(rawBlock) {
+			continue
+		}
+
+		// If any external or internal addresses were detected in this
+		// block, we return them to the caller so that the rescan
+		// windows can widened with subsequent addresses. The
+		// `BatchIndex` is returned so that the caller can compute the
+		// *next* block from which to begin again.
+		resp := &FilterBlocksResponse{
+			BatchIndex:         uint32(i),
+			BlockMeta:          blk,
+			FoundExternalAddrs: blockFilterer.FoundExternal,
+			FoundInternalAddrs: blockFilterer.FoundInternal,
+			RelevantTxns:       blockFilterer.RelevantTxns,
+		}
+
+		return resp, nil
+	}
+
+	// No addresses were found for this range.
+	return nil, nil
 }
 
 // Rescan replicates the RPC client's Rescan command.
