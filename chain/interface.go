@@ -31,6 +31,7 @@ type Interface interface {
 	GetBlock(*chainhash.Hash) (*wire.MsgBlock, error)
 	GetBlockHash(int64) (*chainhash.Hash, error)
 	GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader, error)
+	FilterBlocks(*FilterBlocksRequest) (*FilterBlocksResponse, error)
 	BlockStamp() (*waddrmgr.BlockStamp, error)
 	SendRawTransaction(*wire.MsgTx, bool) (*chainhash.Hash, error)
 	Rescan(*chainhash.Hash, []btcutil.Address, []*wire.OutPoint) error
@@ -59,6 +60,20 @@ type (
 	FilteredBlockConnected struct {
 		Block       *wtxmgr.BlockMeta
 		RelevantTxs []*wtxmgr.TxRecord
+	}
+
+	FilterBlocksRequest struct {
+		Blocks        []wtxmgr.BlockMeta
+		ExternalAddrs map[waddrmgr.ScopedIndex]btcutil.Address
+		InternalAddrs map[waddrmgr.ScopedIndex]btcutil.Address
+	}
+
+	FilterBlocksResponse struct {
+		BatchIndex         uint32
+		BlockMeta          wtxmgr.BlockMeta
+		FoundExternalAddrs map[waddrmgr.KeyScope]map[uint32]struct{}
+		FoundInternalAddrs map[waddrmgr.KeyScope]map[uint32]struct{}
+		RelevantTxns       []*wire.MsgTx
 	}
 
 	// BlockDisconnected is a notifcation that the block described by the
