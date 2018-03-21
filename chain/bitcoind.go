@@ -70,7 +70,6 @@ func NewBitcoindClient(chainParams *chaincfg.Params, connect, user, pass,
 			Pass:                 pass,
 			DisableAutoReconnect: false,
 			DisableConnectOnNew:  true,
-			DisableTLS:           true,
 			HTTPPostMode:         true,
 		},
 		chainParams:         chainParams,
@@ -774,6 +773,158 @@ func (c *BitcoindClient) reorg(bs *waddrmgr.BlockStamp, block *wire.MsgBlock) er
 	}
 
 	return nil
+}
+
+func (c *BitcoindClient) FilterBlocks(
+	req *FilterBlocksRequest) (*FilterBlocksResponse, error) {
+
+	blockFilterer := NewBlockFilterer(
+		c.chainParams, req.ExternalAddrs, req.InternalAddrs,
+	)
+
+	// Iterate over the requested blocks, fetching each from the rpc client.
+	// Each block will scanned using the reverse addresses indexes generated
+	// above, breaking out early if any addresses are found.
+	for i, block := range req.Blocks {
+		rawBlock, err := c.client.GetBlock(&block.Hash)
+		if err != nil {
+			return nil, err
+		}
+
+		if !blockFilterer.FilterBlock(rawBlock) {
+			continue
+		}
+
+		// If any external or internal addresses were detected in this
+		// block, we return them to the caller so that the rescan
+		// windows can widened with subsequent addresses. The
+		// `BatchIndex` is returned so that the caller can compute the
+		// *next* block from which to begin again.
+		resp := &FilterBlocksResponse{
+			BatchIndex:         uint32(i),
+			BlockMeta:          block,
+			FoundExternalAddrs: blockFilterer.FoundExternal,
+			FoundInternalAddrs: blockFilterer.FoundInternal,
+			RelevantTxns:       blockFilterer.RelevantTxns,
+		}
+
+		return resp, nil
+	}
+
+	// No addresses were found for this range.
+	return nil, nil
+}
+
+type BlockFilterer struct {
+	Params *chaincfg.Params
+
+	ExReverseFilter map[string]waddrmgr.ScopedIndex
+	InReverseFilter map[string]waddrmgr.ScopedIndex
+
+	FoundExternal map[waddrmgr.KeyScope]map[uint32]struct{}
+	FoundInternal map[waddrmgr.KeyScope]map[uint32]struct{}
+	RelevantTxns  []*wire.MsgTx
+}
+
+func NewBlockFilterer(params *chaincfg.Params, externalAddrs,
+	internalAddrs map[waddrmgr.ScopedIndex]btcutil.Address) *BlockFilterer {
+
+	// Construct a reverse index by address string for the requested
+	// external addresses.
+	nExAddrs := len(externalAddrs)
+	exReverseFilter := make(map[string]waddrmgr.ScopedIndex, nExAddrs)
+	for scopedIndex, addr := range externalAddrs {
+		exReverseFilter[addr.EncodeAddress()] = scopedIndex
+	}
+
+	// Construct a reverse index by address string for the requested
+	// internal addresses.
+	nInAddrs := len(internalAddrs)
+	inReverseFilter := make(map[string]waddrmgr.ScopedIndex, nInAddrs)
+	for scopedIndex, addr := range internalAddrs {
+		inReverseFilter[addr.EncodeAddress()] = scopedIndex
+	}
+
+	log.Infof("ExternalFilter: %v", exReverseFilter)
+	log.Infof("InternalFilter: %v", inReverseFilter)
+
+	foundExternal := make(map[waddrmgr.KeyScope]map[uint32]struct{})
+	foundInternal := make(map[waddrmgr.KeyScope]map[uint32]struct{})
+
+	return &BlockFilterer{
+		Params:          params,
+		ExReverseFilter: exReverseFilter,
+		InReverseFilter: inReverseFilter,
+		FoundExternal:   foundExternal,
+		FoundInternal:   foundInternal,
+	}
+}
+
+func (bf *BlockFilterer) FilterBlock(block *wire.MsgBlock) bool {
+	var foundAddrs bool
+	for i, tx := range block.Transactions {
+		if bf.FilterTx(tx) {
+			log.Infof("found outputs in tx %d", i)
+			bf.RelevantTxns = append(bf.RelevantTxns, tx)
+			foundAddrs = true
+		}
+	}
+
+	return foundAddrs
+}
+
+func (bf *BlockFilterer) FilterTx(tx *wire.MsgTx) bool {
+	var isRelevant bool
+	for i, out := range tx.TxOut {
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+			out.PkScript, bf.Params,
+		)
+		if err != nil {
+			log.Errorf("Could not parse output script in %s:%d: %v",
+				tx.TxHash(), i, err)
+			continue
+		}
+
+		if bf.FilterOutputAddrs(addrs) {
+			log.Infof("found outputs in txout %d", i)
+			isRelevant = true
+		}
+	}
+
+	return isRelevant
+}
+
+func (bf *BlockFilterer) FilterOutputAddrs(addrs []btcutil.Address) bool {
+	var isRelevant bool
+	for _, addr := range addrs {
+		addrStr := addr.EncodeAddress()
+		if scopedIndex, ok := bf.ExReverseFilter[addrStr]; ok {
+			log.Infof("found external addr %s", addrStr)
+			bf.foundExternal(scopedIndex)
+			isRelevant = true
+		}
+		if scopedIndex, ok := bf.InReverseFilter[addrStr]; ok {
+			log.Infof("found internal addr %s", addrStr)
+			bf.foundInternal(scopedIndex)
+			isRelevant = true
+		}
+	}
+
+	return isRelevant
+}
+
+func (bf *BlockFilterer) foundExternal(scopedIndex waddrmgr.ScopedIndex) {
+	if _, ok := bf.FoundExternal[scopedIndex.Scope]; !ok {
+		bf.FoundExternal[scopedIndex.Scope] = make(map[uint32]struct{})
+	}
+	bf.FoundExternal[scopedIndex.Scope][scopedIndex.Index] = struct{}{}
+}
+
+func (bf *BlockFilterer) foundInternal(scopedIndex waddrmgr.ScopedIndex) {
+	if _, ok := bf.FoundInternal[scopedIndex.Scope]; !ok {
+		bf.FoundInternal[scopedIndex.Scope] = make(map[uint32]struct{})
+	}
+	bf.FoundInternal[scopedIndex.Scope][scopedIndex.Index] = struct{}{}
 }
 
 // rescan performs a rescan of the chain using a bitcoind back-end, from the
