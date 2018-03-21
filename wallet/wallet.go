@@ -77,6 +77,8 @@ type Wallet struct {
 
 	lockedOutpoints map[wire.OutPoint]struct{}
 
+	recoveryWindow uint32
+
 	// Channels for rescan processing.  Requests are added and merged with
 	// any waiting requests, before being sent to another goroutine to
 	// call the rescan RPC.
@@ -366,6 +368,17 @@ func (w *Wallet) syncWithChain() error {
 			logHeight = bestHeight
 		}
 
+		var recoveryMgr *RecoveryManager
+		isRecovery := w.recoveryWindow > 0
+		if isRecovery {
+			// Only allocate the recoveryMgr if we are actually in
+			// recovery mode. This spares us from needlessly
+			// allocating ~300KB with the current parameterization.
+			recoveryMgr = NewRecoveryManager(
+				w.recoveryWindow, 10000,
+			)
+		}
+
 		log.Infof("Catching up block hashes to height %d, this will "+
 			"take a while...", logHeight)
 
@@ -420,10 +433,23 @@ func (w *Wallet) syncWithChain() error {
 				return err
 			}
 
+			// Check to see if this header's timestamp has surpassed
+			// our birthday. If we are in recovery mode and the
+			// check passes, we will add this block to our list of
+			// blocks to scan for recovered addresses.
+			timestamp := header.Timestamp
+			if isRecovery && timestamp.After(w.Manager.Birthday()) {
+				log.Infof("adding block height=%d to batch",
+					height)
+				recoveryMgr.AddToBlockBatch(
+					hash, height, timestamp,
+				)
+			}
+
 			err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
 				Hash:      *hash,
 				Height:    height,
-				Timestamp: header.Timestamp,
+				Timestamp: timestamp,
 			})
 			if err != nil {
 				tx.Rollback()
@@ -432,6 +458,29 @@ func (w *Wallet) syncWithChain() error {
 
 			// Every 10K blocks, commit and start a new database TX.
 			if height%10000 == 0 {
+				// Before committing, if we are in recovery
+				// mode, we will scan all blocks that have been
+				// added to the recovery manager's block batch.
+				// If block batch is empty, this will be a NOP.
+				if isRecovery {
+					log.Infof("perfoming intermediate "+
+						"recovery on %d blocks",
+						len(recoveryMgr.BlockBatch()))
+					err := w.recoverDefaultScopes(
+						chainClient, tx, ns,
+						recoveryMgr.BlockBatch(),
+						recoveryMgr.State(),
+					)
+					if err != nil {
+						tx.Rollback()
+						return err
+					}
+
+					// Clear the batch of any processed
+					// blocks.
+					recoveryMgr.ResetBlockBatch()
+				}
+
 				err = tx.Commit()
 				if err != nil {
 					tx.Rollback()
@@ -446,6 +495,19 @@ func (w *Wallet) syncWithChain() error {
 				}
 
 				ns = tx.ReadWriteBucket(waddrmgrNamespaceKey)
+			}
+		}
+
+		if isRecovery {
+			log.Infof("perfoming final recovery on %d blocks",
+				len(recoveryMgr.BlockBatch()))
+			err := w.recoverDefaultScopes(
+				chainClient, tx, ns, recoveryMgr.BlockBatch(),
+				recoveryMgr.State(),
+			)
+			if err != nil {
+				tx.Rollback()
+				return err
 			}
 		}
 
@@ -535,6 +597,300 @@ func (w *Wallet) syncWithChain() error {
 	}
 
 	return w.Rescan(addrs, unspent)
+}
+
+// recoverDefaultScopes attempts to recover any addresses belonging to any
+// active scoped key managers known to the wallet. Recovery of each scope's
+// default account will be done iteratively against the same batch of blocks.
+// TODO(conner): parallelize/pipeline/cache intermediate network requests
+func (w *Wallet) recoverDefaultScopes(chainClient chain.Interface,
+	tx walletdb.ReadWriteTx, ns walletdb.ReadWriteBucket,
+	batch []wtxmgr.BlockMeta,
+	scopedRecoveryState *ScopedRecoveryState) error {
+
+	scopedMgrs := make(map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager)
+	for _, scope := range waddrmgr.DefaultKeyScopes {
+		scopedMgr, err := w.Manager.FetchScopedKeyManager(scope)
+		if err != nil {
+			return err
+		}
+
+		scopedMgrs[scope] = scopedMgr
+	}
+
+	return w.recoverScopedAddresses(
+		chainClient, tx, ns, batch, scopedRecoveryState, scopedMgrs,
+	)
+}
+
+func externalKeyPath(index uint32) waddrmgr.DerivationPath {
+	return waddrmgr.DerivationPath{
+		Account: waddrmgr.DefaultAccountNum,
+		Branch:  waddrmgr.ExternalBranch,
+		Index:   index,
+	}
+}
+
+func internalKeyPath(index uint32) waddrmgr.DerivationPath {
+	return waddrmgr.DerivationPath{
+		Account: waddrmgr.DefaultAccountNum,
+		Branch:  waddrmgr.InternalBranch,
+		Index:   index,
+	}
+}
+
+func expandScopeHorizons(
+	ns walletdb.ReadWriteBucket,
+	scopedMgr *waddrmgr.ScopedKeyManager,
+	accountState *AccountRecoveryState) error {
+
+	// Compute the current external horizon and the number of addresses we
+	// must derive to ensure we maintain a sufficient recovery window for
+	// the external branch.
+	exHorizon, exWindow := accountState.ExternalBranch.ExtendHorizon()
+	count, childIndex := uint32(0), exHorizon
+	for count < exWindow {
+		keyPath := externalKeyPath(childIndex)
+		addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath)
+		if err != nil && err != hdkeychain.ErrInvalidChild {
+			return err
+		} else if err == hdkeychain.ErrInvalidChild {
+			accountState.ExternalBranch.MarkInvalidChild(childIndex)
+			childIndex++
+			continue
+		}
+
+		// Register the newly generated external address and child index
+		// with the external branch recovery state.
+		accountState.ExternalBranch.AddAddr(childIndex, addr.Address())
+
+		childIndex++
+		count++
+	}
+
+	// Compute the current internal horizon and the number of addresses we
+	// must derive to ensure we maintain a sufficient recovery window for
+	// the internal branch.
+	inHorizon, inWindow := accountState.InternalBranch.ExtendHorizon()
+	count, childIndex = 0, inHorizon
+	for count < inWindow {
+		keyPath := internalKeyPath(childIndex)
+		addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath)
+		if err != nil && err != hdkeychain.ErrInvalidChild {
+			return err
+		} else if err == hdkeychain.ErrInvalidChild {
+			accountState.InternalBranch.MarkInvalidChild(childIndex)
+			childIndex++
+			continue
+		}
+
+		// Register the newly generated internal address and child index
+		// with the internal branch recovery state.
+		accountState.InternalBranch.AddAddr(childIndex, addr.Address())
+
+		childIndex++
+		count++
+	}
+
+	return nil
+}
+
+func buildFilterBlocksRequest(batch []wtxmgr.BlockMeta,
+	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
+	scopedRecoveryState *ScopedRecoveryState) *chain.FilterBlocksRequest {
+
+	filterReq := &chain.FilterBlocksRequest{
+		Blocks:        batch,
+		ExternalAddrs: make(map[waddrmgr.ScopedIndex]btcutil.Address),
+		InternalAddrs: make(map[waddrmgr.ScopedIndex]btcutil.Address),
+	}
+
+	for scope := range scopedMgrs {
+		scopeState := scopedRecoveryState.StateForScope(scope)
+		for index, addr := range scopeState.ExternalBranch.Addrs() {
+			scopedIndex := waddrmgr.ScopedIndex{
+				Scope: scope,
+				Index: index,
+			}
+			filterReq.ExternalAddrs[scopedIndex] = addr
+		}
+		for index, addr := range scopeState.InternalBranch.Addrs() {
+			scopedIndex := waddrmgr.ScopedIndex{
+				Scope: scope,
+				Index: index,
+			}
+			filterReq.InternalAddrs[scopedIndex] = addr
+		}
+	}
+
+	return filterReq
+}
+
+func extendFoundAddresses(ns walletdb.ReadWriteBucket,
+	filterResp *chain.FilterBlocksResponse,
+	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
+	scopedRecoveryState *ScopedRecoveryState) error {
+
+	for scope, indexes := range filterResp.FoundExternalAddrs {
+		scopedMgr := scopedMgrs[scope]
+		accountState := scopedRecoveryState.StateForScope(scope)
+		for index := range indexes {
+			accountState.ExternalBranch.ReportFound(index)
+		}
+
+		exLastFound := accountState.ExternalBranch.LastFound()
+		err := scopedMgr.ExtendExternalAddresses(
+			ns, waddrmgr.DefaultAccountNum, exLastFound,
+		)
+		if err != nil {
+			return err
+		}
+
+		for index := range indexes {
+			addr := accountState.ExternalBranch.GetAddr(index)
+			err := scopedMgr.MarkUsed(ns, addr)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	for scope, indexes := range filterResp.FoundInternalAddrs {
+		scopedMgr := scopedMgrs[scope]
+		accountState := scopedRecoveryState.StateForScope(scope)
+		for index := range indexes {
+			accountState.InternalBranch.ReportFound(index)
+		}
+
+		inLastFound := accountState.InternalBranch.LastFound()
+		err := scopedMgr.ExtendInternalAddresses(
+			ns, waddrmgr.DefaultAccountNum, inLastFound,
+		)
+		if err != nil {
+			return err
+		}
+
+		for index := range indexes {
+			addr := accountState.InternalBranch.GetAddr(index)
+			err := scopedMgr.MarkUsed(ns, addr)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// recoverAccountAddresses scans a range of blocks in attempts to recover any
+// previously used addresses for a particular account derivation path. At a high
+// level, the algorithm works as follows:
+//  1) Ensure internal and external branch horizons are fully expanded.
+//  2) Filter the entire range of blocks, stopping if a non-zero number of
+//       address are contained in a particular block.
+//  3) Record all internal and external addresses found in the block.
+//  4) Trim the range of blocks up to and including the one reporting the addrs.
+//  5) Repeat from (1) if there are still more blocks in the range.
+func (w *Wallet) recoverScopedAddresses(chainClient chain.Interface,
+	tx walletdb.ReadWriteTx, ns walletdb.ReadWriteBucket,
+	batch []wtxmgr.BlockMeta, scopedRecoveryState *ScopedRecoveryState,
+	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager) error {
+
+	// If there are no blocks in the batch, we are done.
+	if len(batch) == 0 {
+		return nil
+	}
+
+expandHorizons:
+	for scope, scopedMgr := range scopedMgrs {
+		scopeState := scopedRecoveryState.StateForScope(scope)
+		err := expandScopeHorizons(ns, scopedMgr, scopeState)
+		if err != nil {
+			return err
+		}
+	}
+
+	// With the internal and external horizons properly expanded, we now
+	// construct the filter blocks request. The request includes the range
+	// of blocks we intend to scan, in addition to the child-index -> addr
+	// map for the internal and external branches.
+	filterReq := buildFilterBlocksRequest(
+		batch, scopedMgrs, scopedRecoveryState,
+	)
+
+	// Initiate the filter blocks request using our chain backend. If an
+	// error occurs, we are unable to proceed with the recovery.
+	filterResp, err := chainClient.FilterBlocks(filterReq)
+	if err != nil {
+		return err
+	}
+
+	// If the filter response is empty, this signals that the rest
+	// of the batch was completed, and no other addresses were
+	// discovered. As a result, no further modifications to our recovery
+	// state are required and we can proceed to the next batch.
+	if filterResp == nil {
+		return nil
+	}
+
+	// Otherwise, retrieve the block info for the block that detected a
+	// non-zero number of address matches.
+	block := batch[filterResp.BatchIndex]
+
+	// Log the number of external or internal addresses found in this block.
+	var nFoundExternal int
+	for _, indexes := range filterResp.FoundExternalAddrs {
+		nFoundExternal += len(indexes)
+	}
+	if nFoundExternal > 0 {
+		log.Infof("Recovered %d external addrs at height=%d hash=%v",
+			nFoundExternal, block.Height, block.Hash)
+	}
+	var nFoundInternal int
+	for _, indexes := range filterResp.FoundInternalAddrs {
+		nFoundInternal += len(indexes)
+	}
+	if nFoundInternal > 0 {
+		log.Infof("Recovered %d internal addrs at height=%d hash=%v",
+			nFoundInternal, block.Height, block.Hash)
+	}
+
+	// Report any external or internal addresses found as a result of the
+	// appropriate branch recovery state. Adding indexes above the
+	// last-found index of either will result in the horizons being expanded
+	// upon the next iteration. Any found addresses are also marked used
+	// using the scoped key manager.
+	err = extendFoundAddresses(
+		ns, filterResp, scopedMgrs, scopedRecoveryState,
+	)
+	if err != nil {
+		return err
+	}
+
+	for _, txn := range filterResp.RelevantTxns {
+		txRecord, err := wtxmgr.NewTxRecordFromMsgTx(
+			txn, filterResp.BlockMeta.Time,
+		)
+		if err != nil {
+			return err
+		}
+
+		err = w.addRelevantTx(tx, txRecord, &filterResp.BlockMeta)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Update the batch to indicate that we've processed all block through
+	// the one that returned found addresses.
+	batch = batch[filterResp.BatchIndex+1:]
+
+	// If this was not the last block in the batch, we will repeat the
+	// filtering process again after expanding our horizons.
+	if len(batch) > 0 {
+		goto expandHorizons
+	}
+
+	return nil
 }
 
 type (
@@ -2695,7 +3051,9 @@ func (w *Wallet) Database() walletdb.DB {
 // Create creates an new wallet, writing it to an empty database.  If the passed
 // seed is non-nil, it is used.  Otherwise, a secure random seed of the
 // recommended length is generated.
-func Create(db walletdb.DB, pubPass, privPass, seed []byte, params *chaincfg.Params) error {
+func Create(db walletdb.DB, pubPass, privPass, seed []byte, params *chaincfg.Params,
+	birthday time.Time) error {
+
 	// If a seed was provided, ensure that it is of valid length. Otherwise,
 	// we generate a random seed for the wallet with the recommended seed
 	// length.
@@ -2723,7 +3081,7 @@ func Create(db walletdb.DB, pubPass, privPass, seed []byte, params *chaincfg.Par
 		}
 
 		err = waddrmgr.Create(addrmgrNs, seed, pubPass, privPass,
-			params, nil)
+			params, nil, birthday)
 		if err != nil {
 			return err
 		}
@@ -2732,7 +3090,9 @@ func Create(db walletdb.DB, pubPass, privPass, seed []byte, params *chaincfg.Par
 }
 
 // Open loads an already-created wallet from the passed database and namespaces.
-func Open(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks, params *chaincfg.Params) (*Wallet, error) {
+func Open(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
+	params *chaincfg.Params, recoveryWindow uint32) (*Wallet, error) {
+
 	err := walletdb.View(db, func(tx walletdb.ReadTx) error {
 		waddrmgrBucket := tx.ReadBucket(waddrmgrNamespaceKey)
 		if waddrmgrBucket == nil {
@@ -2791,6 +3151,7 @@ func Open(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks, params *c
 		Manager:             addrMgr,
 		TxStore:             txMgr,
 		lockedOutpoints:     map[wire.OutPoint]struct{}{},
+		recoveryWindow:      recoveryWindow,
 		rescanAddJob:        make(chan *RescanJob),
 		rescanBatch:         make(chan *rescanBatch),
 		rescanNotifications: make(chan interface{}),
