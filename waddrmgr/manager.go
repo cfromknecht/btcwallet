@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -66,15 +67,15 @@ const (
 	// derivation.
 	maxCoinType = hdkeychain.HardenedKeyStart - 1
 
-	// externalBranch is the child number to use when performing BIP0044
+	// ExternalBranch is the child number to use when performing BIP0044
 	// style hierarchical deterministic key derivation for the external
 	// branch.
-	externalBranch uint32 = 0
+	ExternalBranch uint32 = 0
 
-	// internalBranch is the child number to use when performing BIP0044
+	// InternalBranch is the child number to use when performing BIP0044
 	// style hierarchical deterministic key derivation for the internal
 	// branch.
-	internalBranch uint32 = 1
+	InternalBranch uint32 = 1
 
 	// saltSize is the number of bytes of the salt used when hashing
 	// private passphrases.
@@ -1321,12 +1322,12 @@ func deriveAccountKey(coinTypeKey *hdkeychain.ExtendedKey,
 // The branch is 0 for external addresses and 1 for internal addresses.
 func checkBranchKeys(acctKey *hdkeychain.ExtendedKey) error {
 	// Derive the external branch as the first child of the account key.
-	if _, err := acctKey.Child(externalBranch); err != nil {
+	if _, err := acctKey.Child(ExternalBranch); err != nil {
 		return err
 	}
 
 	// Derive the external branch as the second child of the account key.
-	_, err := acctKey.Child(internalBranch)
+	_, err := acctKey.Child(InternalBranch)
 	return err
 }
 
@@ -1435,6 +1436,8 @@ func loadManager(ns walletdb.ReadBucket, pubPassphrase []byte,
 		if err != nil {
 			return err
 		}
+
+		log.Printf("loading scope=%v schema=%v\n", scope, scopeSchema)
 
 		scopedManagers[scope] = &ScopedKeyManager{
 			scope:      scope,
@@ -1618,7 +1621,8 @@ func createManagerKeyScope(ns walletdb.ReadWriteBucket,
 // A ManagerError with an error code of ErrAlreadyExists will be returned the
 // address manager already exists in the specified namespace.
 func Create(ns walletdb.ReadWriteBucket, seed, pubPassphrase, privPassphrase []byte,
-	chainParams *chaincfg.Params, config *ScryptOptions) error {
+	chainParams *chaincfg.Params, config *ScryptOptions,
+	birthday time.Time) error {
 
 	// Return an error if the manager has already been created in
 	// the given database namespace.
@@ -1786,5 +1790,5 @@ func Create(ns walletdb.ReadWriteBucket, seed, pubPassphrase, privPassphrase []b
 	}
 
 	// Use 48 hours as margin of safety for wallet birthday.
-	return putBirthday(ns, time.Now().Add(-48*time.Hour))
+	return putBirthday(ns, birthday.Add(-24*time.Hour))
 }
