@@ -4,7 +4,9 @@ import (
 	"time"
 
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
+	"github.com/roasbeef/btcd/wire"
 	"github.com/roasbeef/btcutil"
+	"github.com/roasbeef/btcwallet/chain"
 	"github.com/roasbeef/btcwallet/waddrmgr"
 	"github.com/roasbeef/btcwallet/wtxmgr"
 )
@@ -19,19 +21,17 @@ type RecoveryManager struct {
 	// started is true after the first block has been added to the batch.
 	started bool
 
-	// blockBatch contains a list of blocks that have not yet been searched
-	// for recovered addresses.
-	blockBatch []wtxmgr.BlockMeta
-
 	// state encapsulates and allocates the necessary recovery state for all
 	// key scopes and subsidiary derivation paths.
 	state *ScopedRecoveryState
+
+	blockBatch *chain.BlockBatch
 }
 
 func NewRecoveryManager(recoveryWindow, batchSize uint32) *RecoveryManager {
 	return &RecoveryManager{
 		recoveryWindow: recoveryWindow,
-		blockBatch:     make([]wtxmgr.BlockMeta, 0, batchSize),
+		blockBatch:     chain.NewBlockBatch(batchSize),
 		state:          NewScopedRecoveryState(recoveryWindow),
 	}
 }
@@ -48,24 +48,25 @@ func (rm *RecoveryManager) AddToBlockBatch(hash *chainhash.Hash, height int32,
 		rm.started = true
 	}
 
-	block := wtxmgr.BlockMeta{
-		Block: wtxmgr.Block{
-			Hash:   *hash,
-			Height: height,
+	maybeBlock := &chain.MaybeBlock{
+		BlockMeta: wtxmgr.BlockMeta{
+			Block: wtxmgr.Block{
+				Hash:   *hash,
+				Height: height,
+			},
+			Time: timestamp,
 		},
-		Time: timestamp,
+		State:  chain.FetchStateInit,
+		Block:  make(chan *wire.MsgBlock, 1),
+		Cancel: make(chan struct{}),
 	}
-	rm.blockBatch = append(rm.blockBatch, block)
+
+	rm.blockBatch.AppendMaybeBlock(maybeBlock)
 }
 
 // BlockBatch returns a buffer of blocks that have not yet been searched.
-func (rm *RecoveryManager) BlockBatch() []wtxmgr.BlockMeta {
+func (rm *RecoveryManager) BlockBatch() *chain.BlockBatch {
 	return rm.blockBatch
-}
-
-// ResetBlockBatch resets the internal block buffer to conserve memory.
-func (rm *RecoveryManager) ResetBlockBatch() {
-	rm.blockBatch = rm.blockBatch[:0]
 }
 
 // State returns the current ScopedRecoveryState.
