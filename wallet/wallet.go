@@ -465,7 +465,7 @@ func (w *Wallet) syncWithChain() error {
 				if isRecovery {
 					log.Infof("perfoming intermediate "+
 						"recovery on %d blocks",
-						len(recoveryMgr.BlockBatch()))
+						recoveryMgr.BlockBatch().Size())
 					err := w.recoverDefaultScopes(
 						chainClient, tx, ns,
 						recoveryMgr.BlockBatch(),
@@ -478,7 +478,7 @@ func (w *Wallet) syncWithChain() error {
 
 					// Clear the batch of any processed
 					// blocks.
-					recoveryMgr.ResetBlockBatch()
+					recoveryMgr.BlockBatch().ResetBlockBatch()
 				}
 
 				err = tx.Commit()
@@ -500,7 +500,7 @@ func (w *Wallet) syncWithChain() error {
 
 		if isRecovery {
 			log.Infof("perfoming final recovery on %d blocks",
-				len(recoveryMgr.BlockBatch()))
+				recoveryMgr.BlockBatch().Size())
 			err := w.recoverDefaultScopes(
 				chainClient, tx, ns, recoveryMgr.BlockBatch(),
 				recoveryMgr.State(),
@@ -605,7 +605,7 @@ func (w *Wallet) syncWithChain() error {
 // TODO(conner): parallelize/pipeline/cache intermediate network requests
 func (w *Wallet) recoverDefaultScopes(chainClient chain.Interface,
 	tx walletdb.ReadWriteTx, ns walletdb.ReadWriteBucket,
-	batch []wtxmgr.BlockMeta,
+	batch *chain.BlockBatch,
 	scopedRecoveryState *ScopedRecoveryState) error {
 
 	scopedMgrs := make(map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager)
@@ -695,12 +695,12 @@ func expandScopeHorizons(
 	return nil
 }
 
-func buildFilterBlocksRequest(batch []wtxmgr.BlockMeta,
+func buildFilterBlocksRequest(batch *chain.BlockBatch,
 	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
 	scopedRecoveryState *ScopedRecoveryState) *chain.FilterBlocksRequest {
 
 	filterReq := &chain.FilterBlocksRequest{
-		Blocks:        batch,
+		BlockBatch:    batch,
 		ExternalAddrs: make(map[waddrmgr.ScopedIndex]btcutil.Address),
 		InternalAddrs: make(map[waddrmgr.ScopedIndex]btcutil.Address),
 	}
@@ -792,11 +792,11 @@ func extendFoundAddresses(ns walletdb.ReadWriteBucket,
 //  5) Repeat from (1) if there are still more blocks in the range.
 func (w *Wallet) recoverScopedAddresses(chainClient chain.Interface,
 	tx walletdb.ReadWriteTx, ns walletdb.ReadWriteBucket,
-	batch []wtxmgr.BlockMeta, scopedRecoveryState *ScopedRecoveryState,
+	batch *chain.BlockBatch, scopedRecoveryState *ScopedRecoveryState,
 	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager) error {
 
 	// If there are no blocks in the batch, we are done.
-	if len(batch) == 0 {
+	if batch.Size() == 0 {
 		return nil
 	}
 
@@ -834,7 +834,7 @@ expandHorizons:
 
 	// Otherwise, retrieve the block info for the block that detected a
 	// non-zero number of address matches.
-	block := batch[filterResp.BatchIndex]
+	block := batch.GetBlockMeta(filterResp.BatchIndex)
 
 	// Log the number of external or internal addresses found in this block.
 	var nFoundExternal int
@@ -882,11 +882,11 @@ expandHorizons:
 
 	// Update the batch to indicate that we've processed all block through
 	// the one that returned found addresses.
-	batch = batch[filterResp.BatchIndex+1:]
+	// batch = batch[filterResp.BatchIndex+1:]
 
 	// If this was not the last block in the batch, we will repeat the
 	// filtering process again after expanding our horizons.
-	if len(batch) > 0 {
+	if batch.Size() > 0 {
 		goto expandHorizons
 	}
 
