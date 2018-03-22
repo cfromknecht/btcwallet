@@ -778,38 +778,40 @@ func (c *BitcoindClient) reorg(bs *waddrmgr.BlockStamp, block *wire.MsgBlock) er
 func (c *BitcoindClient) FilterBlocks(
 	req *FilterBlocksRequest) (*FilterBlocksResponse, error) {
 
-	blockFilterer := NewBlockFilterer(
-		c.chainParams, req.ExternalAddrs, req.InternalAddrs,
-	)
+	/*
+		blockFilterer := NewBlockFilterer(
+			c.chainParams, req.ExternalAddrs, req.InternalAddrs,
+		)
 
-	// Iterate over the requested blocks, fetching each from the rpc client.
-	// Each block will scanned using the reverse addresses indexes generated
-	// above, breaking out early if any addresses are found.
-	for i, block := range req.Blocks {
-		rawBlock, err := c.client.GetBlock(&block.Hash)
-		if err != nil {
-			return nil, err
+		// Iterate over the requested blocks, fetching each from the rpc client.
+		// Each block will scanned using the reverse addresses indexes generated
+		// above, breaking out early if any addresses are found.
+		for i, block := range req.Blocks {
+			rawBlock, err := c.client.GetBlock(&block.Hash)
+			if err != nil {
+				return nil, err
+			}
+
+			if !blockFilterer.FilterBlock(rawBlock) {
+				continue
+			}
+
+			// If any external or internal addresses were detected in this
+			// block, we return them to the caller so that the rescan
+			// windows can widened with subsequent addresses. The
+			// `BatchIndex` is returned so that the caller can compute the
+			// *next* block from which to begin again.
+			resp := &FilterBlocksResponse{
+				BatchIndex:         uint32(i),
+				BlockMeta:          block,
+				FoundExternalAddrs: blockFilterer.FoundExternal,
+				FoundInternalAddrs: blockFilterer.FoundInternal,
+				RelevantTxns:       blockFilterer.RelevantTxns,
+			}
+
+			return resp, nil
 		}
-
-		if !blockFilterer.FilterBlock(rawBlock) {
-			continue
-		}
-
-		// If any external or internal addresses were detected in this
-		// block, we return them to the caller so that the rescan
-		// windows can widened with subsequent addresses. The
-		// `BatchIndex` is returned so that the caller can compute the
-		// *next* block from which to begin again.
-		resp := &FilterBlocksResponse{
-			BatchIndex:         uint32(i),
-			BlockMeta:          block,
-			FoundExternalAddrs: blockFilterer.FoundExternal,
-			FoundInternalAddrs: blockFilterer.FoundInternal,
-			RelevantTxns:       blockFilterer.RelevantTxns,
-		}
-
-		return resp, nil
-	}
+	*/
 
 	// No addresses were found for this range.
 	return nil, nil
