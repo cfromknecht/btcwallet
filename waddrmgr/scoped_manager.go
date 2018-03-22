@@ -2,6 +2,7 @@ package waddrmgr
 
 import (
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/roasbeef/btcd/btcec"
@@ -51,6 +52,11 @@ type KeyScope struct {
 	// child of the purpose key. With this key, any accounts, or other
 	// children can be derived at all.
 	Coin uint32
+}
+
+type ScopedIndex struct {
+	Scope KeyScope
+	Index uint32
 }
 
 // String returns a human readable version describing the keypath encapsulated
@@ -204,7 +210,7 @@ func (s *ScopedKeyManager) keyToManaged(derivedKey *hdkeychain.ExtendedKey,
 	account, branch, index uint32) (ManagedAddress, error) {
 
 	var addrType AddressType
-	if branch == internalBranch {
+	if branch == InternalBranch {
 		addrType = s.addrSchema.InternalAddrType
 	} else {
 		addrType = s.addrSchema.ExternalAddrType
@@ -233,7 +239,7 @@ func (s *ScopedKeyManager) keyToManaged(derivedKey *hdkeychain.ExtendedKey,
 		s.deriveOnUnlock = append(s.deriveOnUnlock, &info)
 	}
 
-	if branch == internalBranch {
+	if branch == InternalBranch {
 		ma.internal = true
 	}
 
@@ -297,7 +303,7 @@ func (s *ScopedKeyManager) loadAccountInfo(ns walletdb.ReadBucket,
 	row, ok := rowInterface.(*dbDefaultAccountRow)
 	if !ok {
 		str := fmt.Sprintf("unsupported account type %T", row)
-		err = managerError(ErrDatabase, str, nil)
+		return nil, managerError(ErrDatabase, str, nil)
 	}
 
 	// Use the crypto public key to decrypt the account public extended
@@ -345,7 +351,7 @@ func (s *ScopedKeyManager) loadAccountInfo(ns walletdb.ReadBucket,
 	}
 
 	// Derive and cache the managed address for the last external address.
-	branch, index := externalBranch, row.nextExternalIndex
+	branch, index := ExternalBranch, row.nextExternalIndex
 	if index > 0 {
 		index--
 	}
@@ -362,7 +368,7 @@ func (s *ScopedKeyManager) loadAccountInfo(ns walletdb.ReadBucket,
 	acctInfo.lastExternalAddr = lastExtAddr
 
 	// Derive and cache the managed address for the last internal address.
-	branch, index = internalBranch, row.nextInternalIndex
+	branch, index = InternalBranch, row.nextInternalIndex
 	if index > 0 {
 		index--
 	}
@@ -670,9 +676,9 @@ func (s *ScopedKeyManager) nextAddresses(ns walletdb.ReadWriteBucket,
 
 	// Choose the branch key and index depending on whether or not this is
 	// an internal address.
-	branchNum, nextIndex := externalBranch, acctInfo.nextExternalIndex
+	branchNum, nextIndex := ExternalBranch, acctInfo.nextExternalIndex
 	if internal {
-		branchNum = internalBranch
+		branchNum = InternalBranch
 		nextIndex = acctInfo.nextInternalIndex
 	}
 
@@ -817,6 +823,187 @@ func (s *ScopedKeyManager) nextAddresses(ns walletdb.ReadWriteBucket,
 	return managedAddresses, nil
 }
 
+// extendAddresses returns the specified number of next chained address from the
+// branch indicated by the internal flag.
+//
+// This function MUST be called with the manager lock held for writes.
+func (s *ScopedKeyManager) extendAddresses(ns walletdb.ReadWriteBucket,
+	account uint32, lastIndex uint32, internal bool) error {
+
+	// The next address can only be generated for accounts that have
+	// already been created.
+	acctInfo, err := s.loadAccountInfo(ns, account)
+	if err != nil {
+		return err
+	}
+
+	// Choose the account key to used based on whether the address manager
+	// is locked.
+	acctKey := acctInfo.acctKeyPub
+	if !s.rootManager.IsLocked() {
+		acctKey = acctInfo.acctKeyPriv
+	}
+
+	// Choose the branch key and index depending on whether or not this is
+	// an internal address.
+	branchNum, nextIndex := ExternalBranch, acctInfo.nextExternalIndex
+	if internal {
+		log.Printf("extending internal branch\n")
+		branchNum = InternalBranch
+		nextIndex = acctInfo.nextInternalIndex
+	} else {
+		log.Printf("extending external branch\n")
+	}
+
+	addrType := s.addrSchema.ExternalAddrType
+	if internal {
+		addrType = s.addrSchema.InternalAddrType
+	}
+
+	// If the last index requested is already lower than the next index, we
+	// can return early.
+	if lastIndex < nextIndex {
+		return nil
+	}
+
+	// Ensure the requested number of addresses doesn't exceed the maximum
+	// allowed for this account.
+	if lastIndex > MaxAddressesPerAccount {
+		str := fmt.Sprintf("last index %d would exceed the maximum "+
+			"allowed number of addresses per account of %d",
+			lastIndex, MaxAddressesPerAccount)
+		return managerError(ErrTooManyAddresses, str, nil)
+	}
+
+	// Derive the appropriate branch key and ensure it is zeroed when done.
+	branchKey, err := acctKey.Child(branchNum)
+	if err != nil {
+		str := fmt.Sprintf("failed to derive extended key branch %d",
+			branchNum)
+		return managerError(ErrKeyChain, str, err)
+	}
+	defer branchKey.Zero() // Ensure branch key is zeroed when done.
+
+	log.Printf("extending from index %d to %d\n", nextIndex, lastIndex)
+
+	// Create the requested number of addresses and keep track of the index
+	// with each one.
+	addressInfo := make([]*unlockDeriveInfo, 0, lastIndex-nextIndex)
+	for nextIndex <= lastIndex {
+		// There is an extremely small chance that a particular child is
+		// invalid, so use a loop to derive the next valid child.
+		var nextKey *hdkeychain.ExtendedKey
+		for {
+			// Derive the next child in the external chain branch.
+			key, err := branchKey.Child(nextIndex)
+			if err != nil {
+				// When this particular child is invalid, skip to the
+				// next index.
+				if err == hdkeychain.ErrInvalidChild {
+					nextIndex++
+					continue
+				}
+
+				str := fmt.Sprintf("failed to generate child %d",
+					nextIndex)
+				return managerError(ErrKeyChain, str, err)
+			}
+			key.SetNet(s.rootManager.chainParams)
+
+			log.Printf("derived index %d\n", nextIndex)
+
+			nextIndex++
+			nextKey = key
+			break
+		}
+
+		// Create a new managed address based on the public or private
+		// key depending on whether the generated key is private.
+		// Also, zero the next key after creating the managed address
+		// from it.
+		addr, err := newManagedAddressFromExtKey(
+			s, account, nextKey, addrType,
+		)
+		if err != nil {
+			return err
+		}
+		if internal {
+			addr.internal = true
+		}
+		managedAddr := addr
+		nextKey.Zero()
+
+		info := unlockDeriveInfo{
+			managedAddr: managedAddr,
+			branch:      branchNum,
+			index:       nextIndex - 1,
+		}
+		addressInfo = append(addressInfo, &info)
+	}
+
+	log.Printf("created %d addresses\n", len(addressInfo))
+
+	// Now that all addresses have been successfully generated, update the
+	// database in a single transaction.
+	for _, info := range addressInfo {
+		ma := info.managedAddr
+		addressID := ma.Address().ScriptAddress()
+
+		switch a := ma.(type) {
+		case *managedAddress:
+			err := putChainedAddress(
+				ns, &s.scope, addressID, account, ssFull,
+				info.branch, info.index, adtChain,
+			)
+			if err != nil {
+				return maybeConvertDbError(err)
+			}
+		case *scriptAddress:
+			encryptedHash, err := s.rootManager.cryptoKeyPub.Encrypt(a.AddrHash())
+			if err != nil {
+				str := fmt.Sprintf("failed to encrypt script hash %x",
+					a.AddrHash())
+				return managerError(ErrCrypto, str, err)
+			}
+
+			err = putScriptAddress(
+				ns, &s.scope, a.AddrHash(), ImportedAddrAccount,
+				ssNone, encryptedHash, a.scriptEncrypted,
+			)
+			if err != nil {
+				return maybeConvertDbError(err)
+			}
+		}
+	}
+
+	// Finally update the next address tracking and add the addresses to
+	// the cache after the newly generated addresses have been successfully
+	// added to the db.
+	for _, info := range addressInfo {
+		ma := info.managedAddr
+		s.addrs[addrKey(ma.Address().ScriptAddress())] = ma
+
+		// Add the new managed address to the list of addresses that
+		// need their private keys derived when the address manager is
+		// next unlocked.
+		if s.rootManager.IsLocked() && !s.rootManager.WatchOnly() {
+			s.deriveOnUnlock = append(s.deriveOnUnlock, info)
+		}
+	}
+
+	// Set the last address and next address for tracking.
+	ma := addressInfo[len(addressInfo)-1].managedAddr
+	if internal {
+		acctInfo.nextInternalIndex = nextIndex
+		acctInfo.lastInternalAddr = ma
+	} else {
+		acctInfo.nextExternalIndex = nextIndex
+		acctInfo.lastExternalAddr = ma
+	}
+
+	return nil
+}
+
 // NextExternalAddresses returns the specified number of next chained addresses
 // that are intended for external use from the address manager.
 func (s *ScopedKeyManager) NextExternalAddresses(ns walletdb.ReadWriteBucket,
@@ -849,6 +1036,34 @@ func (s *ScopedKeyManager) NextInternalAddresses(ns walletdb.ReadWriteBucket,
 	defer s.mtx.Unlock()
 
 	return s.nextAddresses(ns, account, numAddresses, true)
+}
+
+func (s *ScopedKeyManager) ExtendExternalAddresses(ns walletdb.ReadWriteBucket,
+	account uint32, lastIndex uint32) error {
+
+	if account > MaxAccountNum {
+		err := managerError(ErrAccountNumTooHigh, errAcctTooHigh, nil)
+		return err
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	return s.extendAddresses(ns, account, lastIndex, false)
+}
+
+func (s *ScopedKeyManager) ExtendInternalAddresses(ns walletdb.ReadWriteBucket,
+	account uint32, lastIndex uint32) error {
+
+	if account > MaxAccountNum {
+		err := managerError(ErrAccountNumTooHigh, errAcctTooHigh, nil)
+		return err
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	return s.extendAddresses(ns, account, lastIndex, true)
 }
 
 // LastExternalAddress returns the most recently requested chained external
