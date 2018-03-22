@@ -191,34 +191,97 @@ func (s *NeutrinoClient) FilterBlocks(
 		watchList = append(watchList, addr.ScriptAddress())
 	}
 
+	blockBatch := req.BlockBatch
+
 	// Iterate over the requested blocks, fetching each from the rpc client.
 	// Each block will scanned using the reverse addresses indexes generated
 	// above, breaking out early if any addresses are found.
-	for i, blk := range req.Blocks {
-		filter, err := s.CS.GetCFilter(blk.Hash, wire.GCSFilterRegular)
-		if err != nil {
-			return nil, err
-		}
+	var matchedBlocks []uint32
+refetch:
+	start, size := req.BlockBatch.Range()
+	if start >= size {
+		return nil, nil
+	}
 
-		if filter == nil || filter.N() == 0 {
-			log.Infof("empty filter at height=%d", blk.Height)
-			continue
-		}
+	var prefetchStart = start
+	if len(matchedBlocks) > 0 {
+		prefetchStart = matchedBlocks[len(matchedBlocks)-1] + 1
+	}
 
-		key := builder.DeriveKey(&blk.Hash)
-		matched, err := filter.MatchAny(key, watchList)
-		if err != nil {
-			return nil, err
-		} else if !matched {
-			continue
+	matchedBlocks = make([]uint32, 0, size-prefetchStart)
+	for i := prefetchStart; i < size; i++ {
+		maybeBlock := blockBatch.GetMaybeBlock(i)
+		blk := maybeBlock.BlockMeta
+
+		if !blockBatch.IsKnownMatch(i) {
+			filter, err := s.CS.GetCFilter(
+				blk.Hash, wire.GCSFilterRegular,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			if filter == nil || filter.N() == 0 {
+				log.Infof("empty filter at height=%d", blk.Height)
+				continue
+			}
+
+			key := builder.DeriveKey(&blk.Hash)
+			matched, err := filter.MatchAny(key, watchList)
+			if err != nil {
+				return nil, err
+			} else if !matched {
+				continue
+			}
 		}
 
 		log.Infof("matched block height=%d", blk.Height)
 
-		rawBlock, err := s.GetBlock(&blk.Hash)
-		if err != nil {
-			return nil, err
+		blockBatch.MarkKnownMatch(i)
+		matchedBlocks = append(matchedBlocks, i)
+
+		needPrefetch, more := blockBatch.ShouldPrefetch(i)
+		if needPrefetch {
+			log.Infof("prefetching block height=%d", blk.Height)
+			go func(ii uint32, mb *MaybeBlock) {
+				rawBlock, err := s.GetBlock(&mb.BlockMeta.Hash)
+				if err != nil {
+					blockBatch.Fail(ii, mb.Sequence)
+					return
+				}
+
+				blockBatch.Receive(ii, mb.Sequence, rawBlock)
+			}(i, maybeBlock)
 		}
+
+		if !more {
+			break
+		}
+	}
+
+	if len(matchedBlocks) == 0 {
+		goto refetch
+	}
+
+	var lastProcessed uint32
+	for _, i := range matchedBlocks {
+		blk := blockBatch.GetBlockMeta(i)
+		log.Infof("getting prefetched block height=%d",
+			blk.Height)
+
+		rawBlock := blockBatch.GetBlock(i)
+		if rawBlock == nil {
+			log.Infof("manually fetching block height=%d",
+				blk.Height)
+			var err error
+			rawBlock, err = s.GetBlock(&blk.Hash)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		blockBatch.MarkDone(i)
+		lastProcessed = i
 
 		if !blockFilterer.FilterBlock(rawBlock) {
 			continue
@@ -238,6 +301,10 @@ func (s *NeutrinoClient) FilterBlocks(
 		}
 
 		return resp, nil
+	}
+
+	if lastProcessed+1 < size {
+		goto refetch
 	}
 
 	// No addresses were found for this range.
