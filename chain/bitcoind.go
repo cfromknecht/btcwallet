@@ -847,9 +847,6 @@ func NewBlockFilterer(params *chaincfg.Params, externalAddrs,
 		inReverseFilter[addr.EncodeAddress()] = scopedIndex
 	}
 
-	log.Infof("ExternalFilter: %v", exReverseFilter)
-	log.Infof("InternalFilter: %v", inReverseFilter)
-
 	foundExternal := make(map[waddrmgr.KeyScope]map[uint32]struct{})
 	foundInternal := make(map[waddrmgr.KeyScope]map[uint32]struct{})
 
