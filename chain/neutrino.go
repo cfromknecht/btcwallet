@@ -183,7 +183,7 @@ func (s *NeutrinoClient) FilterBlocks(
 	)
 
 	nAddrs := len(req.ExternalAddrs) + len(req.InternalAddrs)
-	watchList := make([][]byte, nAddrs)
+	watchList := make([][]byte, 0, nAddrs)
 	for _, addr := range req.ExternalAddrs {
 		watchList = append(watchList, addr.ScriptAddress())
 	}
