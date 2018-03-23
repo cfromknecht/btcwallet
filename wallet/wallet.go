@@ -439,8 +439,6 @@ func (w *Wallet) syncWithChain() error {
 			// blocks to scan for recovered addresses.
 			timestamp := header.Timestamp
 			if isRecovery && timestamp.After(w.Manager.Birthday()) {
-				log.Infof("adding block height=%d to batch",
-					height)
 				recoveryMgr.AddToBlockBatch(
 					hash, height, timestamp,
 				)
