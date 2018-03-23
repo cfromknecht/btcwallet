@@ -157,10 +157,11 @@ func NewBlockBatch(batchSize uint32) *BlockBatch {
 	}
 
 	return &BlockBatch{
-		lookAhead: 250,
-		requested: make(map[uint32]struct{}),
-		blockSema: blockSema,
-		batch:     make([]*MaybeBlock, 0, batchSize),
+		lookAhead:    250,
+		knownMatches: make(map[uint32]struct{}),
+		requested:    make(map[uint32]struct{}),
+		blockSema:    blockSema,
+		batch:        make([]*MaybeBlock, 0, batchSize),
 	}
 }
 
