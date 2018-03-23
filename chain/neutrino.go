@@ -209,7 +209,10 @@ refetch:
 	}
 
 	matchedBlocks = make([]uint32, 0, size-prefetchStart)
+	var lastFiltered = prefetchStart
 	for i := prefetchStart; i < size; i++ {
+		lastFiltered = i
+
 		maybeBlock := blockBatch.GetMaybeBlock(i)
 		blk := maybeBlock.BlockMeta
 
@@ -233,11 +236,11 @@ refetch:
 			} else if !matched {
 				continue
 			}
+
+			log.Infof("matched block height=%d", blk.Height)
+			blockBatch.MarkKnownMatch(i)
 		}
 
-		log.Infof("matched block height=%d", blk.Height)
-
-		blockBatch.MarkKnownMatch(i)
 		matchedBlocks = append(matchedBlocks, i)
 
 		needPrefetch, more := blockBatch.ShouldPrefetch(i)
@@ -260,6 +263,7 @@ refetch:
 	}
 
 	if len(matchedBlocks) == 0 {
+		blockBatch.MarkDone(lastFiltered)
 		goto refetch
 	}
 
