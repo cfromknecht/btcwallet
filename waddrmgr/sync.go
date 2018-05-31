@@ -48,7 +48,7 @@ func newSyncState(startBlock, syncedTo *BlockStamp) *syncState {
 // imported addresses will be used.  This effectively allows the manager to be
 // marked as unsynced back to the oldest known point any of the addresses have
 // appeared in the block chain.
-func (m *Manager) SetSyncedTo(ns walletdb.ReadWriteBucket, bs *BlockStamp) error {
+func (m *Manager) SetSyncedTo(bs *BlockStamp) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -58,15 +58,21 @@ func (m *Manager) SetSyncedTo(ns walletdb.ReadWriteBucket, bs *BlockStamp) error
 		bs = &m.syncState.startBlock
 	}
 
-	// Update the database.
-	err := putSyncedTo(ns, bs)
-	if err != nil {
-		return err
-	}
-
 	// Update memory now that the database is updated.
 	m.syncState.syncedTo = *bs
-	return nil
+}
+
+// PutSyncedTo writes the tip of the current chain described by the block stamp
+// to the address manager's persistent namespace.
+func (m *Manager) PutSyncedTo(ns walletdb.ReadWriteBucket, bs *BlockStamp) error {
+	// Use the stored start blockstamp and reset recent hashes and height
+	// when the provided blockstamp is nil.
+	if bs == nil {
+		bs = &m.syncState.startBlock
+	}
+
+	// Update the database.
+	return putSyncedTo(ns, bs)
 }
 
 // SyncedTo returns details about the block height and hash that the address
