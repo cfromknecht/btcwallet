@@ -480,16 +480,6 @@ func (w *Wallet) syncWithChain() error {
 				)
 			}
 
-			err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
-				Hash:      *hash,
-				Height:    height,
-				Timestamp: timestamp,
-			})
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-
 			// If we are in recovery mode, attempt a recovery on
 			// blocks that have been added to the recovery manager's
 			// block batch thus far. If block batch is empty, this
@@ -511,12 +501,25 @@ func (w *Wallet) syncWithChain() error {
 
 			// Every 10K blocks, commit and start a new database TX.
 			if height%10000 == 0 {
+				blockStamp := &waddrmgr.BlockStamp{
+					Hash:      *hash,
+					Height:    height,
+					Timestamp: timestamp,
+				}
+
+				err = w.Manager.PutSyncedTo(ns, blockStamp)
+				if err != nil {
+					tx.Rollback()
+					return err
+				}
+
 				err = tx.Commit()
 				if err != nil {
 					tx.Rollback()
 					return err
 				}
 
+				w.Manager.SetSyncedTo(blockStamp)
 				log.Infof("Caught up to height %d", height)
 
 				tx, err = w.db.BeginReadWriteTx()
@@ -541,12 +544,26 @@ func (w *Wallet) syncWithChain() error {
 			}
 		}
 
+		blockStamp := &waddrmgr.BlockStamp{
+			Hash:      *hash,
+			Height:    height,
+			Timestamp: timestamp,
+		}
+
+		err = w.Manager.PutSyncedTo(ns, blockStamp)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+
 		// Commit (or roll back) the final database transaction.
 		err = tx.Commit()
 		if err != nil {
 			tx.Rollback()
 			return err
 		}
+		k
+		w.Manager.SetSyncedTo(blockStamp)
 		log.Info("Done catching up block hashes")
 
 		// Since we've spent some time catching up block hashes, we
@@ -566,11 +583,11 @@ func (w *Wallet) syncWithChain() error {
 	// Compare previously-seen blocks against the chain server.  If any of
 	// these blocks no longer exist, rollback all of the missing blocks
 	// before catching up with the rescan.
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+	var rollbackStamp = w.Manager.SyncedTo()
+	var err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 		rollback := false
-		rollbackStamp := w.Manager.SyncedTo()
 		for height := rollbackStamp.Height; true; height-- {
 			hash, err := w.Manager.BlockHash(addrmgrNs, height)
 			if err != nil {
@@ -595,7 +612,7 @@ func (w *Wallet) syncWithChain() error {
 			rollback = true
 		}
 		if rollback {
-			err := w.Manager.SetSyncedTo(addrmgrNs, &rollbackStamp)
+			err := w.Manager.PutSyncedTo(addrmgrNs, &rollbackStamp)
 			if err != nil {
 				return err
 			}
@@ -612,6 +629,8 @@ func (w *Wallet) syncWithChain() error {
 	if err != nil {
 		return err
 	}
+
+	w.Manager.SetSyncedTo(&rollbackStamp)
 
 	// Request notifications for connected and disconnected blocks.
 	//
@@ -1364,11 +1383,12 @@ func (w *Wallet) AccountAddresses(account uint32) (addrs []btcutil.Address, err 
 // the balance will be calculated based on how many how many blocks
 // include a UTXO.
 func (w *Wallet) CalculateBalance(confirms int32) (btcutil.Amount, error) {
+	blk := w.Manager.SyncedTo()
+
 	var balance btcutil.Amount
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
 		var err error
-		blk := w.Manager.SyncedTo()
 		balance, err = w.TxStore.Balance(txmgrNs, confirms, blk.Height)
 		return err
 	})
@@ -1390,14 +1410,14 @@ type Balances struct {
 // are not indexed by the accounts they credit to, and all unspent transaction
 // outputs must be iterated.
 func (w *Wallet) CalculateAccountBalances(account uint32, confirms int32) (Balances, error) {
+	// Get current block.  The block height used for calculating
+	// the number of tx confirmations.
+	syncBlock := w.Manager.SyncedTo()
+
 	var bals Balances
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
 
 		unspent, err := w.TxStore.UnspentOutputs(txmgrNs)
 		if err != nil {
@@ -1859,12 +1879,12 @@ func (w *Wallet) ListSinceBlock(start, end, syncHeight int32) ([]btcjson.ListTra
 func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsResult, error) {
 	txList := []btcjson.ListTransactionsResult{}
 
+	// Get current block.  The block height used for calculating
+	// the number of tx confirmations.
+	syncBlock := w.Manager.SyncedTo()
+
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
 
 		// Need to skip the first from transactions, and after those, only
 		// include the next count transactions.
@@ -1910,13 +1930,13 @@ func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsRe
 // recorded transactions to or from any address belonging to a set.  This is
 // intended to be used for listaddresstransactions RPC replies.
 func (w *Wallet) ListAddressTransactions(pkHashes map[string]struct{}) ([]btcjson.ListTransactionsResult, error) {
+	// Get current block.  The block height used for calculating
+	// the number of tx confirmations.
+	syncBlock := w.Manager.SyncedTo()
+
 	txList := []btcjson.ListTransactionsResult{}
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
 		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
 		loopDetails:
 			for i := range details {
@@ -1959,13 +1979,13 @@ func (w *Wallet) ListAddressTransactions(pkHashes map[string]struct{}) ([]btcjso
 // transaction.  This is intended to be used for listalltransactions RPC
 // replies.
 func (w *Wallet) ListAllTransactions() ([]btcjson.ListTransactionsResult, error) {
+	// Get current block.  The block height used for calculating
+	// the number of tx confirmations.
+	syncBlock := w.Manager.SyncedTo()
+
 	txList := []btcjson.ListTransactionsResult{}
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
 
 		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
 			// Iterate over transactions at this height in reverse order.
@@ -2158,6 +2178,8 @@ func (w *Wallet) Accounts(scope waddrmgr.KeyScope) (*AccountsResult, error) {
 		return nil, err
 	}
 
+	syncBlock := w.Manager.SyncedTo()
+
 	var (
 		accounts        []AccountResult
 		syncBlockHash   *chainhash.Hash
@@ -2167,7 +2189,6 @@ func (w *Wallet) Accounts(scope waddrmgr.KeyScope) (*AccountsResult, error) {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
 
-		syncBlock := w.Manager.SyncedTo()
 		syncBlockHash = &syncBlock.Hash
 		syncBlockHeight = syncBlock.Height
 		unspent, err := w.TxStore.UnspentOutputs(txmgrNs)
@@ -2234,12 +2255,12 @@ func (w *Wallet) AccountBalances(scope waddrmgr.KeyScope,
 		return nil, err
 	}
 
+	syncBlock := w.Manager.SyncedTo()
+
 	var results []AccountBalanceResult
 	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		syncBlock := w.Manager.SyncedTo()
 
 		// Fill out all account info except for the balances.
 		lastAcct, err := manager.LastAccount(addrmgrNs)
@@ -2342,12 +2363,12 @@ func (s creditSlice) Swap(i, j int) {
 func (w *Wallet) ListUnspent(minconf, maxconf int32,
 	addresses map[string]struct{}) ([]*btcjson.ListUnspentResult, error) {
 
+	syncBlock := w.Manager.SyncedTo()
+
 	var results []*btcjson.ListUnspentResult
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		syncBlock := w.Manager.SyncedTo()
 
 		filter := len(addresses) != 0
 		unspent, err := w.TxStore.UnspentOutputs(txmgrNs)
@@ -2894,12 +2915,12 @@ func (w *Wallet) TotalReceivedForAccounts(scope waddrmgr.KeyScope,
 		return nil, err
 	}
 
+	syncBlock := w.Manager.SyncedTo()
+
 	var results []AccountTotalReceivedResult
 	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		syncBlock := w.Manager.SyncedTo()
 
 		err := manager.ForEachAccount(addrmgrNs, func(account uint32) error {
 			accountName, err := manager.AccountName(addrmgrNs, account)
@@ -2957,11 +2978,12 @@ func (w *Wallet) TotalReceivedForAccounts(scope waddrmgr.KeyScope,
 // returning the total amount of bitcoins received for a single wallet
 // address.
 func (w *Wallet) TotalReceivedForAddr(addr btcutil.Address, minConf int32) (btcutil.Amount, error) {
+
+	syncBlock := w.Manager.SyncedTo()
+
 	var amount btcutil.Amount
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		syncBlock := w.Manager.SyncedTo()
 
 		var (
 			addrStr    = addr.EncodeAddress()
