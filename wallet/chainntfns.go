@@ -47,13 +47,16 @@ func (w *Wallet) handleChainNotifications() {
 		// if it doesn't match the original hash returned by
 		// the notification, to roll back and restart the
 		// rescan.
-		log.Infof("Catching up block hashes to height %d, this"+
-			" might take a while", height)
+
+		startBlock := w.Manager.SyncedTo()
+		log.Infof("Catching up block hashes from height %d to %d, this "+
+			"might take a while", startBlock.Height, height)
+
+		var blockStamp waddrmgr.BlockStamp
 		err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
-			startBlock := w.Manager.SyncedTo()
-
+			var blockStamp = startBlock
 			for i := startBlock.Height + 1; i <= height; i++ {
 				hash, err := client.GetBlockHash(int64(i))
 				if err != nil {
@@ -64,22 +67,21 @@ func (w *Wallet) handleChainNotifications() {
 					return err
 				}
 
-				bs := waddrmgr.BlockStamp{
+				blockStamp = waddrmgr.BlockStamp{
 					Height:    i,
 					Hash:      *hash,
 					Timestamp: header.Timestamp,
 				}
-				err = w.Manager.SetSyncedTo(ns, &bs)
-				if err != nil {
-					return err
-				}
 			}
-			return nil
+
+			return w.Manager.PutSyncedTo(ns, &blockStamp)
 		})
 		if err != nil {
 			log.Errorf("Failed to update address manager "+
 				"sync state for height %d: %v", height, err)
 		}
+
+		w.Manager.SetSyncedTo(&blockStamp)
 
 		log.Info("Done catching up block hashes")
 		return err
@@ -98,14 +100,10 @@ func (w *Wallet) handleChainNotifications() {
 			case chain.ClientConnected:
 				go sync(w)
 			case chain.BlockConnected:
-				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-					return w.connectBlock(tx, wtxmgr.BlockMeta(n))
-				})
+				err = w.connectBlock(wtxmgr.BlockMeta(n))
 				notificationName = "blockconnected"
 			case chain.BlockDisconnected:
-				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-					return w.disconnectBlock(tx, wtxmgr.BlockMeta(n))
-				})
+				err = w.disconnectBlock(wtxmgr.BlockMeta(n))
 				notificationName = "blockdisconnected"
 			case chain.RelevantTx:
 				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
@@ -172,53 +170,68 @@ func (w *Wallet) handleChainNotifications() {
 // connectBlock handles a chain server notification by marking a wallet
 // that's currently in-sync with the chain server as being synced up to
 // the passed block.
-func (w *Wallet) connectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) error {
-	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-	bs := waddrmgr.BlockStamp{
+func (w *Wallet) connectBlock(b wtxmgr.BlockMeta) error {
+	blockStamp := waddrmgr.BlockStamp{
 		Height:    b.Height,
 		Hash:      b.Hash,
 		Timestamp: b.Time,
 	}
-	err := w.Manager.SetSyncedTo(addrmgrNs, &bs)
+
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) {
+		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		return w.Manager.PutSyncedTo(addrmgrNs, &blockStamp)
+
+	})
 	if err != nil {
 		return err
 	}
 
+	w.Manager.SetSyncedTo(&blockStamp)
+
 	// Notify interested clients of the connected block.
 	//
 	// TODO: move all notifications outside of the database transaction.
-	w.NtfnServer.notifyAttachedBlock(dbtx, &b)
+	w.NtfnServer.notifyAttachedBlock(dbtx, &blockStamp)
+
 	return nil
 }
 
 // disconnectBlock handles a chain server reorganize by rolling back all
 // block history from the reorged block for a wallet in-sync with the chain
 // server.
-func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) error {
-	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
-	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
-
+func (w *Wallet) disconnectBlock(b wtxmgr.BlockMeta) error {
 	if !w.ChainSynced() {
 		return nil
 	}
 
-	// Disconnect the removed block and all blocks after it if we know about
-	// the disconnected block. Otherwise, the block is in the future.
-	if b.Height <= w.Manager.SyncedTo().Height {
-		hash, err := w.Manager.BlockHash(addrmgrNs, b.Height)
-		if err != nil {
-			return err
-		}
-		if bytes.Equal(hash[:], b.Hash[:]) {
-			bs := waddrmgr.BlockStamp{
-				Height: b.Height - 1,
-			}
-			hash, err = w.Manager.BlockHash(addrmgrNs, bs.Height)
+	currentHeight := w.Manager.SyncedTo().Height
+
+	var blockStamp waddrmgr.BlockStamp
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+
+		// Disconnect the removed block and all blocks after it if we know about
+		// the disconnected block. Otherwise, the block is in the future.
+		if b.Height <= currentHeight {
+			hash, err := w.Manager.BlockHash(addrmgrNs, b.Height)
 			if err != nil {
 				return err
 			}
-			b.Hash = *hash
+			if !bytes.Equal(hash[:], b.Hash[:]) {
+				return nil
+			}
+			blockStamp := waddrmgr.BlockStamp{
+				Height: b.Height - 1,
+			}
+
+			hash, err = w.Manager.BlockHash(
+				addrmgrNs, blockStamp.Height,
+			)
+			if err != nil {
+				return err
+			}
+			blockStamp.Hash = *hash
 
 			client := w.ChainClient()
 			header, err := client.GetBlockHeader(hash)
@@ -226,15 +239,21 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 				return err
 			}
 
-			bs.Timestamp = header.Timestamp
+			blockStamp.Timestamp = header.Timestamp
 
-			err = w.Manager.SetSyncedTo(addrmgrNs, &bs)
+			err = w.Manager.PutSyncedTo(addrmgrNs, &blockStamp)
 			if err != nil {
 				return err
 			}
-			err = w.TxStore.Rollback(txmgrNs, b.Height)
+
+			return w.TxStore.Rollback(txmgrNs, blockStamp.Height)
 		}
+	})
+	if err != nil {
+		return err
 	}
+
+	w.Manager.SetSyncedTo(&blockStamp)
 
 	// Notify interested clients of the disconnected block.
 	w.NtfnServer.notifyDetachedBlock(&b.Hash)
