@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"strings"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/walletdb"
@@ -177,21 +179,51 @@ func (w *Wallet) connectBlock(b wtxmgr.BlockMeta) error {
 		Timestamp: b.Time,
 	}
 
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		return w.Manager.PutSyncedTo(addrmgrNs, &blockStamp)
+	var (
+		unminedHashes []*chainhash.Hash
+		bals          = make(map[uint32]btcutil.Amount)
+	)
 
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		err := w.Manager.PutSyncedTo(addrmgrNs, &blockStamp)
+		if err != nil {
+			return err
+		}
+
+		// The UnminedTransactions field is intentionally not set.  Since the
+		// hashes of all detached blocks are reported, and all transactions
+		// moved from a mined block back to unconfirmed are either in the
+		// UnminedTransactionHashes slice or don't exist due to conflicting with
+		// a mined transaction in the new best chain, there is no possiblity of
+		// a new, previously unseen transaction appearing in unconfirmed.
+
+		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
+		unminedHashes, err = w.TxStore.UnminedTxHashes(txmgrNs)
+		if err != nil {
+			log.Errorf("Cannot fetch unmined transaction hashes: %v", err)
+			return err
+		}
+
+		for _, b := range w.NtfnServer.currentTxNtfn.AttachedBlocks {
+			relevantAccounts(w, bals, b.Transactions)
+		}
+		err = totalBalances(tx, w, bals)
+		if err != nil {
+			log.Errorf("Cannot determine balances for relevant accounts: %v", err)
+			return err
+		}
+
+		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	w.Manager.SetSyncedTo(&blockStamp)
-
 	// Notify interested clients of the connected block.
-	//
-	// TODO: move all notifications outside of the database transaction.
-	w.NtfnServer.notifyAttachedBlock(dbtx, &blockStamp)
+	w.NtfnServer.notifyAttachedBlock(&b, unminedHashes, bals)
+
+	w.Manager.SetSyncedTo(&blockStamp)
 
 	return nil
 }
@@ -248,15 +280,17 @@ func (w *Wallet) disconnectBlock(b wtxmgr.BlockMeta) error {
 
 			return w.TxStore.Rollback(txmgrNs, blockStamp.Height)
 		}
+
+		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	w.Manager.SetSyncedTo(&blockStamp)
-
 	// Notify interested clients of the disconnected block.
 	w.NtfnServer.notifyDetachedBlock(&b.Hash)
+
+	w.Manager.SetSyncedTo(&blockStamp)
 
 	return nil
 }
