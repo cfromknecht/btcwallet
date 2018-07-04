@@ -257,7 +257,9 @@ func (s *NotificationServer) notifyMinedTransaction(dbtx walletdb.ReadTx, detail
 		append(txs, makeTxSummary(dbtx, s.wallet, details))
 }
 
-func (s *NotificationServer) notifyAttachedBlock(dbtx walletdb.ReadTx, block *wtxmgr.BlockMeta) {
+func (s *NotificationServer) notifyAttachedBlock(block *wtxmgr.BlockMeta,
+	unminedHashes []*chainhash.Hash, bals map[uint32]btcutil.Amount) {
+
 	if s.currentTxNtfn == nil {
 		s.currentTxNtfn = &TransactionNotifications{}
 	}
@@ -281,38 +283,16 @@ func (s *NotificationServer) notifyAttachedBlock(dbtx walletdb.ReadTx, block *wt
 		}
 	}
 
-	defer s.mu.Unlock()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	clients := s.transactions
 	if len(clients) == 0 {
 		s.currentTxNtfn = nil
 		return
 	}
 
-	// The UnminedTransactions field is intentionally not set.  Since the
-	// hashes of all detached blocks are reported, and all transactions
-	// moved from a mined block back to unconfirmed are either in the
-	// UnminedTransactionHashes slice or don't exist due to conflicting with
-	// a mined transaction in the new best chain, there is no possiblity of
-	// a new, previously unseen transaction appearing in unconfirmed.
-
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-	unminedHashes, err := s.wallet.TxStore.UnminedTxHashes(txmgrNs)
-	if err != nil {
-		log.Errorf("Cannot fetch unmined transaction hashes: %v", err)
-		return
-	}
 	s.currentTxNtfn.UnminedTransactionHashes = unminedHashes
-
-	bals := make(map[uint32]btcutil.Amount)
-	for _, b := range s.currentTxNtfn.AttachedBlocks {
-		relevantAccounts(s.wallet, bals, b.Transactions)
-	}
-	err = totalBalances(dbtx, s.wallet, bals)
-	if err != nil {
-		log.Errorf("Cannot determine balances for relevant accounts: %v", err)
-		return
-	}
 	s.currentTxNtfn.NewBalances = flattenBalanceMap(bals)
 
 	for _, c := range clients {
