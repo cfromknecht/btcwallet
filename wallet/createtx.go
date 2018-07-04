@@ -131,9 +131,13 @@ func (w *Wallet) txToOutputs(outputs []*wire.TxOut, account uint32,
 			var changeAddr btcutil.Address
 			var err error
 			if account == waddrmgr.ImportedAddrAccount {
-				changeAddr, err = w.newChangeAddress(addrmgrNs, 0)
+				changeAddr, err = w.newChangeAddress(
+					addrmgrNs, 0, waddrmgr.KeyScopeBIP0084,
+				)
 			} else {
-				changeAddr, err = w.newChangeAddress(addrmgrNs, account)
+				changeAddr, err = w.newChangeAddress(
+					addrmgrNs, account, waddrmgr.KeyScopeBIP0084,
+				)
 			}
 			if err != nil {
 				return nil, err
