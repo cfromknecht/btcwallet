@@ -2818,19 +2818,18 @@ func (w *Wallet) NewChangeAddress(account uint32, scope waddrmgr.KeyScope) (addr
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		var err error
-		addr, err = w.newChangeAddress(addrmgrNs, account)
+		addr, err = w.newChangeAddress(addrmgrNs, account, scope)
 		return err
 	})
 	return
 }
 
-func (w *Wallet) newChangeAddress(addrmgrNs walletdb.ReadWriteBucket, account uint32) (btcutil.Address, error) {
-	// As we're making a change address, we'll fetch the type of manager
-	// that is able to make p2wkh output as they're the most efficient.
-	scopes := w.Manager.ScopesForExternalAddrType(
-		waddrmgr.WitnessPubKey,
-	)
-	manager, err := w.Manager.FetchScopedKeyManager(scopes[0])
+func (w *Wallet) newChangeAddress(addrmgrNs walletdb.ReadWriteBucket,
+	account uint32, scope waddrmgr.KeyScope) (btcutil.Address, error) {
+
+	// Fetch the scope manager that we will use to create the change
+	// address.
+	manager, err := w.Manager.FetchScopedKeyManager(scope)
 	if err != nil {
 		return nil, err
 	}
