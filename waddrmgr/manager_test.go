@@ -1675,12 +1675,13 @@ func testSync(tc *testContext) bool {
 	// being the earliest block (genesis block in this case).
 	err := walletdb.Update(tc.db, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		return tc.rootManager.SetSyncedTo(ns, nil)
+		return tc.rootManager.PutSyncedTo(ns, nil)
 	})
 	if err != nil {
-		tc.t.Errorf("SetSyncedTo unexpected err on nil: %v", err)
+		tc.t.Errorf("PutSyncedTo unexpected err on nil: %v", err)
 		return false
 	}
+	tc.rootManager.SetSyncedTo(nil)
 	blockStamp := waddrmgr.BlockStamp{
 		Height: 0,
 		Hash:   *chaincfg.MainNetParams.GenesisHash,
@@ -1706,12 +1707,13 @@ func testSync(tc *testContext) bool {
 	}
 	err = walletdb.Update(tc.db, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		return tc.rootManager.SetSyncedTo(ns, &blockStamp)
+		return tc.rootManager.PutSyncedTo(ns, &blockStamp)
 	})
 	if err != nil {
-		tc.t.Errorf("SetSyncedTo unexpected err on nil: %v", err)
+		tc.t.Errorf("PutSyncedTo unexpected err on nil: %v", err)
 		return false
 	}
+	tc.rootManager.SetSyncedTo(&blockStamp)
 	gotBlockStamp = tc.rootManager.SyncedTo()
 	if gotBlockStamp != blockStamp {
 		tc.t.Errorf("SyncedTo unexpected block stamp on nil -- "+
