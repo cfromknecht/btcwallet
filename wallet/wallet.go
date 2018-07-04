@@ -425,6 +425,7 @@ func (w *Wallet) syncWithChain() error {
 			}
 		}
 
+		var bestBlockStamp waddrmgr.BlockStamp
 		for height := startHeight; height <= bestHeight; height++ {
 			hash, err := chainClient.GetBlockHash(int64(height))
 			if err != nil {
@@ -469,11 +470,17 @@ func (w *Wallet) syncWithChain() error {
 				return err
 			}
 
+			timestamp := header.Timestamp
+			bestBlockStamp = waddrmgr.BlockStamp{
+				Hash:      *hash,
+				Height:    height,
+				Timestamp: timestamp,
+			}
+
 			// Check to see if this header's timestamp has surpassed
 			// our birthday. If we are in recovery mode and the
 			// check passes, we will add this block to our list of
 			// blocks to scan for recovered addresses.
-			timestamp := header.Timestamp
 			if isRecovery && timestamp.After(w.Manager.Birthday()) {
 				recoveryMgr.AddToBlockBatch(
 					hash, height, timestamp,
@@ -501,13 +508,7 @@ func (w *Wallet) syncWithChain() error {
 
 			// Every 10K blocks, commit and start a new database TX.
 			if height%10000 == 0 {
-				blockStamp := &waddrmgr.BlockStamp{
-					Hash:      *hash,
-					Height:    height,
-					Timestamp: timestamp,
-				}
-
-				err = w.Manager.PutSyncedTo(ns, blockStamp)
+				err = w.Manager.PutSyncedTo(ns, &bestBlockStamp)
 				if err != nil {
 					tx.Rollback()
 					return err
@@ -519,7 +520,7 @@ func (w *Wallet) syncWithChain() error {
 					return err
 				}
 
-				w.Manager.SetSyncedTo(blockStamp)
+				w.Manager.SetSyncedTo(&bestBlockStamp)
 				log.Infof("Caught up to height %d", height)
 
 				tx, err = w.db.BeginReadWriteTx()
@@ -544,13 +545,7 @@ func (w *Wallet) syncWithChain() error {
 			}
 		}
 
-		blockStamp := &waddrmgr.BlockStamp{
-			Hash:      *hash,
-			Height:    height,
-			Timestamp: timestamp,
-		}
-
-		err = w.Manager.PutSyncedTo(ns, blockStamp)
+		err = w.Manager.PutSyncedTo(ns, &bestBlockStamp)
 		if err != nil {
 			tx.Rollback()
 			return err
@@ -562,8 +557,8 @@ func (w *Wallet) syncWithChain() error {
 			tx.Rollback()
 			return err
 		}
-		k
-		w.Manager.SetSyncedTo(blockStamp)
+
+		w.Manager.SetSyncedTo(&bestBlockStamp)
 		log.Info("Done catching up block hashes")
 
 		// Since we've spent some time catching up block hashes, we
@@ -584,7 +579,7 @@ func (w *Wallet) syncWithChain() error {
 	// these blocks no longer exist, rollback all of the missing blocks
 	// before catching up with the rescan.
 	var rollbackStamp = w.Manager.SyncedTo()
-	var err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 		rollback := false
